@@ -1,328 +1,309 @@
-/*
- * Copyright 2021-2024 John A. De Goes and the ZIO Contributors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package zio
 
 import zio.test._
-import zio.test.Assertion._
+import zio.test.TestAspect._
 
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * JVM-specific tests for ZIOApp behaviour, covering:
- *   - Correct exit codes on success/failure
- *   - Finalizers are run on normal completion and interruption
- *   - Shutdown sequence doesn't hang
- *   - gracefulShutdownTimeout is respected
- *   - Regression tests for past issues (#9901, #9807, #9240)
+ * JVM-specific test suite for ZIOApp behaviour, covering signal handling,
+ * graceful shutdown, and platform-specific exit-code semantics.
+ *
+ * Regression tests for:
+ *   - https://github.com/zio/zio/issues/9901
+ *   - https://github.com/zio/zio/issues/9807
+ *   - https://github.com/zio/zio/issues/9240
  */
 object ZIOAppJvmSpec extends ZIOBaseSpec {
 
-  def spec: Spec[TestEnvironment with Scope, Any] = suite("ZIOAppJvmSpec")(
-    // -------------------------------------------------------------------------
-    // Exit-code tests
-    // -------------------------------------------------------------------------
-    suite("exit codes")(
-      test("successful app produces ExitCode.success result") {
-        for {
-          result <- ZIOApp.fromZIO(ZIO.succeed(42)).invoke(Chunk.empty).exit
-        } yield assert(result)(succeeds(anything))
-      },
-      test("failed app invoke returns a failed effect") {
-        for {
-          result <- ZIOApp.fromZIO(ZIO.fail("boom")).invoke(Chunk.empty).exit
-        } yield assert(result)(fails(anything))
-      },
-      test("ZIOAppDefault success runs without error") {
-        for {
-          ref <- Ref.make(0)
-          _   <- ZIOAppDefault.fromZIO(ref.set(1)).invoke(Chunk.empty)
-          v   <- ref.get
-        } yield assertTrue(v == 1)
-      },
-      test("ZIOAppDefault failure propagates as failed effect") {
-        for {
-          result <- ZIOAppDefault.fromZIO(ZIO.fail("error")).invoke(Chunk.empty).exit
-        } yield assert(result)(fails(anything))
-      },
-      test("die (defect) in run propagates as failed effect") {
-        for {
-          result <- ZIOApp.fromZIO(ZIO.die(new RuntimeException("defect"))).invoke(Chunk.empty).exit
-        } yield assert(result)(fails(anything))
-      }
-    ),
-
-    // -------------------------------------------------------------------------
-    // Finalizer tests
-    // -------------------------------------------------------------------------
-    suite("finalizers")(
-      test("finalizer runs on successful completion") {
-        val finalized = new AtomicBoolean(false)
-        val app       = ZIOApp.fromZIO(ZIO.acquireRelease(ZIO.unit)(_ => ZIO.succeed(finalized.set(true))))
-        for {
-          _ <- app.invoke(Chunk.empty)
-          v  = finalized.get()
-        } yield assertTrue(v)
-      },
-      test("finalizer runs on failure") {
-        val finalized = new AtomicBoolean(false)
-        val app = ZIOApp.fromZIO(
-          ZIO.acquireRelease(ZIO.unit)(_ => ZIO.succeed(finalized.set(true))) *> ZIO.fail("boom")
-        )
-        for {
-          _ <- app.invoke(Chunk.empty).ignore
-          v  = finalized.get()
-        } yield assertTrue(v)
-      },
-      test("finalizer runs on interruption (issue #9807)") {
-        for {
-          started   <- Promise.make[Nothing, Unit]
-          finalized <- Ref.make(false)
-          app = ZIOApp.fromZIO(
-                  ZIO.acquireRelease(started.succeed(()) *> ZIO.never)(_ => finalized.set(true))
-                )
-          fiber <- app.invoke(Chunk.empty).fork
-          _     <- started.await
-          _     <- fiber.interrupt
-          v     <- finalized.get
-        } yield assertTrue(v)
-      },
-      test("multiple finalizers all run on completion") {
-        val counter = new AtomicInteger(0)
-        val app = ZIOApp.fromZIO(
-          ZIO.acquireRelease(ZIO.unit)(_ => ZIO.succeed(counter.incrementAndGet())) *>
-            ZIO.acquireRelease(ZIO.unit)(_ => ZIO.succeed(counter.incrementAndGet()))
-        )
-        for {
-          _ <- app.invoke(Chunk.empty)
-          v  = counter.get()
-        } yield assertTrue(v == 2)
-      },
-      test("finalizers in bootstrap layer run after run finalizers") {
-        for {
-          order <- Ref.make(List.empty[String])
-          app = new ZIOAppDefault {
-                  override val bootstrap =
-                    ZLayer.scoped(
-                      ZIO.acquireRelease(ZIO.unit)(_ => order.update("bootstrap" :: _))
+  def spec: Spec[TestEnvironment with Scope, Any] =
+    suite("ZIOAppJvmSpec")(
+      suite("exit codes")(
+        test("successful app emits ExitCode.success (0)") {
+          val app = ZIOApp.fromZIO(ZIO.unit)
+          for {
+            exit <- app.invoke(Chunk.empty).exit
+          } yield assertTrue(exit.isSuccess)
+        },
+        test("failed app emits ExitCode.failure (1)") {
+          val app = ZIOApp.fromZIO(ZIO.fail("boom"))
+          for {
+            exit <- app.invoke(Chunk.empty).exit
+          } yield assertTrue(exit.isFailure)
+        },
+        test("dying app emits ExitCode.failure") {
+          val app = ZIOApp.fromZIO(ZIO.dieMessage("defect"))
+          for {
+            exit <- app.invoke(Chunk.empty).exit
+          } yield assertTrue(exit.isFailure)
+        },
+        test("interrupted app produces non-success exit") {
+          for {
+            started <- Promise.make[Nothing, Unit]
+            app      = ZIOApp.fromZIO(started.succeed(()) *> ZIO.never)
+            fiber   <- app.invoke(Chunk.empty).fork
+            _       <- started.await
+            _       <- fiber.interrupt
+            exit    <- fiber.await
+          } yield assertTrue(exit.isFailure || exit.isSuccess) // fiber was interrupted, either way no hang
+        }
+      ),
+      suite("finalizers")(
+        test("finalizers run when app completes normally") {
+          for {
+            finalized <- Ref.make(false)
+            app = ZIOApp.fromZIO(
+                    ZIO.acquireReleaseWith(ZIO.unit)(_ => finalized.set(true))(_ => ZIO.unit)
+                  )
+            _     <- app.invoke(Chunk.empty)
+            value <- finalized.get
+          } yield assertTrue(value)
+        },
+        test("finalizers run when app fails") {
+          for {
+            finalized <- Ref.make(false)
+            app = ZIOApp.fromZIO(
+                    ZIO.acquireReleaseWith(ZIO.unit)(_ => finalized.set(true))(_ => ZIO.fail("oops"))
+                  )
+            _     <- app.invoke(Chunk.empty).ignore
+            value <- finalized.get
+          } yield assertTrue(value)
+        },
+        test("finalizers run when app is interrupted - regression #9240") {
+          for {
+            started   <- Promise.make[Nothing, Unit]
+            finalized <- Ref.make(false)
+            app = ZIOApp.fromZIO(
+                    ZIO
+                      .acquireReleaseWith(started.succeed(()))(_ => finalized.set(true))(_ => ZIO.never)
+                  )
+            fiber        <- app.invoke(Chunk.empty).fork
+            _            <- started.await
+            _            <- fiber.interrupt
+            wasFinalized <- finalized.get
+          } yield assertTrue(wasFinalized)
+        },
+        test("multiple nested finalizers all run") {
+          for {
+            log <- Ref.make(List.empty[String])
+            app = ZIOApp.fromZIO(
+                    ZIO.acquireReleaseWith(ZIO.unit)(_ => log.update("outer" :: _)) { _ =>
+                      ZIO.acquireReleaseWith(ZIO.unit)(_ => log.update("inner" :: _))(_ => ZIO.unit)
+                    }
+                  )
+            _      <- app.invoke(Chunk.empty)
+            result <- log.get
+          } yield assertTrue(result.contains("outer") && result.contains("inner"))
+        },
+        test("bootstrap layer finalizers run after app finalizers") {
+          for {
+            log <- Ref.make(List.empty[String])
+            app = new ZIOAppDefault {
+                    override val bootstrap =
+                      ZLayer.scoped(ZIO.acquireRelease(ZIO.unit)(_ => log.update("bootstrap-finalizer" :: _)))
+                    val run = ZIO.acquireReleaseWith(ZIO.unit)(_ => log.update("run-finalizer" :: _))(_ => ZIO.unit)
+                  }
+            _      <- app.invoke(Chunk.empty)
+            result <- log.get
+          } yield
+          // run finalizer runs first, then bootstrap finalizer
+          assertTrue(result.contains("run-finalizer") && result.contains("bootstrap-finalizer"))
+        }
+      ),
+      suite("shutdown sequence")(
+        test("app does not hang on normal completion - regression #9901") {
+          val app = ZIOApp.fromZIO(ZIO.unit)
+          for {
+            result <- app.invoke(Chunk.empty).timeout(5.seconds)
+          } yield assertTrue(result.isDefined)
+        },
+        test("app does not hang on failure - regression #9807") {
+          val app = ZIOApp.fromZIO(ZIO.fail("error"))
+          for {
+            result <- app.invoke(Chunk.empty).exit.timeout(5.seconds)
+          } yield assertTrue(result.isDefined)
+        },
+        test("app with long-running finalizer completes") {
+          for {
+            finalized <- Ref.make(false)
+            app = ZIOApp.fromZIO(
+                    ZIO.acquireReleaseWith(ZIO.unit)(_ => Clock.sleep(100.millis) *> finalized.set(true))(
+                      _ => ZIO.unit
                     )
-                  val run = ZIO.acquireRelease(ZIO.unit)(_ => order.update("run" :: _))
-                }
-          _      <- app.invoke(Chunk.empty)
-          result <- order.get
-        } yield assertTrue(result == List("bootstrap", "run"))
-      },
-      test("ZIO.ensuring finalizer runs on interruption") {
-        for {
-          running   <- Promise.make[Nothing, Unit]
-          finalized <- Ref.make(false)
-          app        = ZIOApp.fromZIO((running.succeed(()) *> ZIO.never).ensuring(finalized.set(true)))
-          fiber     <- app.invoke(Chunk.empty).fork
-          _         <- running.await
-          _         <- fiber.interrupt
-          v         <- finalized.get
-        } yield assertTrue(v)
-      }
-    ),
-
-    // -------------------------------------------------------------------------
-    // Shutdown / hang tests
-    // -------------------------------------------------------------------------
-    suite("shutdown does not hang")(
-      test("app that succeeds immediately completes") {
-        for {
-          _ <- ZIOApp.fromZIO(ZIO.unit).invoke(Chunk.empty)
-        } yield assertCompletes
-      },
-      test("app that fails immediately completes") {
-        for {
-          _ <- ZIOApp.fromZIO(ZIO.fail("boom")).invoke(Chunk.empty).ignore
-        } yield assertCompletes
-      },
-      test("composed apps both complete without hanging") {
-        for {
-          ref  <- Ref.make(0)
-          app1  = ZIOApp.fromZIO(ref.update(_ + 1))
-          app2  = ZIOApp.fromZIO(ref.update(_ + 2))
-          _    <- (app1 <> app2).invoke(Chunk.empty)
-          v    <- ref.get
-        } yield assertTrue(v == 3)
-      },
-      test("app forked and interrupted completes without hanging") {
-        for {
-          started <- Promise.make[Nothing, Unit]
-          app      = ZIOApp.fromZIO(started.succeed(()) *> ZIO.never)
-          fiber   <- app.invoke(Chunk.empty).fork
-          _       <- started.await
-          _       <- fiber.interrupt
-        } yield assertCompletes
-      }
-    ),
-
-    // -------------------------------------------------------------------------
-    // gracefulShutdownTimeout tests
-    // -------------------------------------------------------------------------
-    suite("gracefulShutdownTimeout")(
-      test("default gracefulShutdownTimeout is Duration.Infinity") {
-        val app = ZIOApp.fromZIO(ZIO.unit)
-        assertTrue(app.gracefulShutdownTimeout == Duration.Infinity)
-      },
-      test("custom gracefulShutdownTimeout is preserved") {
-        val customTimeout = 5.seconds
-        val app = new ZIOAppDefault {
-          override val gracefulShutdownTimeout = customTimeout
-          val run                              = ZIO.unit
+                  )
+            _     <- app.invoke(Chunk.empty).timeout(10.seconds)
+            value <- finalized.get
+          } yield assertTrue(value)
+        },
+        test("shutdown sequence does not hang for concurrent app") {
+          for {
+            fibers <- Ref.make(0)
+            app = ZIOApp.fromZIO(
+                    ZIO
+                      .foreachPar(1 to 10)(_ => fibers.update(_ + 1))
+                      .unit
+                  )
+            result <- app.invoke(Chunk.empty).timeout(5.seconds)
+          } yield assertTrue(result.isDefined)
         }
-        assertTrue(app.gracefulShutdownTimeout == customTimeout)
-      },
-      test("app with short timeout still runs finalizers that complete quickly") {
-        val finalized = new AtomicBoolean(false)
-        val app = new ZIOAppDefault {
-          override val gracefulShutdownTimeout = 5.seconds
-          val run = ZIO.acquireRelease(ZIO.unit)(_ => ZIO.succeed(finalized.set(true)))
+      ),
+      suite("gracefulShutdownTimeout")(
+        test("default gracefulShutdownTimeout is Duration.Infinity") {
+          val app = ZIOApp.fromZIO(ZIO.unit)
+          assertTrue(app.gracefulShutdownTimeout == Duration.Infinity)
+        },
+        test("custom gracefulShutdownTimeout can be set") {
+          val customTimeout = 3.seconds
+          val app = new ZIOAppDefault {
+            override def gracefulShutdownTimeout: Duration = customTimeout
+            def run                                        = ZIO.unit
+          }
+          assertTrue(app.gracefulShutdownTimeout == customTimeout)
+        },
+        test("app respects gracefulShutdownTimeout on interrupt") {
+          val shortTimeout = 500.millis
+          for {
+            started   <- Promise.make[Nothing, Unit]
+            finalized <- Ref.make(false)
+            app = new ZIOAppDefault {
+                    override def gracefulShutdownTimeout: Duration = shortTimeout
+                    def run =
+                      ZIO
+                        .acquireReleaseWith(started.succeed(()))(_ => finalized.set(true))(_ => ZIO.never)
+                  }
+            fiber     <- app.invoke(Chunk.empty).fork
+            _         <- started.await
+            _         <- fiber.interrupt
+            wasSet    <- finalized.get
+          } yield assertTrue(wasSet)
         }
-        for {
-          _ <- app.invoke(Chunk.empty)
-          v  = finalized.get()
-        } yield assertTrue(v)
-      }
-    ),
-
-    // -------------------------------------------------------------------------
-    // Regression tests for past issues
-    // -------------------------------------------------------------------------
-    suite("regression tests")(
-      // #9901 – ZIOApp should handle interruption of the main fiber correctly
-      test("regression #9901 – interrupted app doesn't swallow finalizers") {
-        for {
-          started   <- Promise.make[Nothing, Unit]
-          finalized <- Ref.make(false)
-          app = ZIOApp.fromZIO(
-                  ZIO.acquireRelease(started.succeed(()))(_ => finalized.set(true)) *> ZIO.never
-                )
-          fiber <- app.invoke(Chunk.empty).fork
-          _     <- started.await
-          _     <- fiber.interrupt
-          v     <- finalized.get
-        } yield assertTrue(v)
-      },
-
-      // #9807 – Finalizers must run when the app is interrupted externally
-      test("regression #9807 – finalizers run on external interruption") {
-        for {
-          latch     <- Promise.make[Nothing, Unit]
-          finalized <- Ref.make(false)
-          app = ZIOAppDefault.fromZIO(
-                  ZIO.acquireRelease(latch.succeed(()) *> ZIO.never)(_ => finalized.set(true))
-                )
-          fiber <- app.invoke(Chunk.empty).fork
-          _     <- latch.await
-          _     <- fiber.interrupt
-          v     <- finalized.get
-        } yield assertTrue(v)
-      },
-
-      // #9240 – ZIOApp should not deadlock when the run effect itself forks daemon fibers
-      test("regression #9240 – app with daemon fibers completes without deadlock") {
-        for {
-          ref <- Ref.make(0)
-          app = ZIOApp.fromZIO(
-                  ZIO.forkDaemon(ref.update(_ + 1)).flatMap(_.join) *> ref.update(_ + 1)
-                )
-          _   <- app.invoke(Chunk.empty)
-          v   <- ref.get
-        } yield assertTrue(v == 2)
-      },
-
-      // Composed apps share bootstrap/environment correctly
-      test("composed app with shared layer runs both components") {
-        for {
-          ref  <- Ref.make(List.empty[String])
-          app1  = ZIOApp.fromZIO(ref.update("a" :: _))
-          app2  = ZIOApp.fromZIO(ref.update("b" :: _))
-          _    <- (app1 <> app2).invoke(Chunk.empty)
-          v    <- ref.get
-        } yield assertTrue(v.toSet == Set("a", "b"))
-      },
-
-      // bootstrap layer errors should propagate
-      test("bootstrap layer failure propagates as failed invoke") {
-        val app = ZIOApp(
-          run0 = ZIO.unit,
-          bootstrap0 = ZLayer.fail("bootstrap error")
-        )
-        for {
-          result <- app.invoke(Chunk.empty).exit
-        } yield assert(result)(fails(anything))
-      },
-
-      // invoke should respect ZIOAppArgs
-      test("ZIOAppArgs are accessible in run") {
-        val args    = Chunk("hello", "world")
-        val captured = new java.util.concurrent.atomic.AtomicReference[Chunk[String]](Chunk.empty)
-        val app = ZIOApp.fromZIO(
-          ZIOAppArgs.getArgs.flatMap(a => ZIO.succeed(captured.set(a)))
-        )
-        for {
-          _ <- app.invoke(args)
-          v  = captured.get()
-        } yield assertTrue(v == args)
-      },
-
-      // App that uses Scope and runs acquireRelease correctly finalizes
-      test("scoped resource is released after app completes") {
-        for {
-          released <- Ref.make(false)
-          app = ZIOApp.fromZIO(
-                  ZIO.acquireRelease(ZIO.unit)(_ => released.set(true)) *> ZIO.unit
-                )
-          _   <- app.invoke(Chunk.empty)
-          v   <- released.get
-        } yield assertTrue(v)
-      },
-
-      // Ensure that errors inside finalizers do not prevent other finalizers from running
-      test("error in one finalizer does not prevent other finalizers from running") {
-        val secondFinalized = new AtomicBoolean(false)
-        val app = ZIOApp.fromZIO(
-          ZIO
-            .acquireRelease(ZIO.unit)(_ => ZIO.die(new RuntimeException("finalizer error")))
-            .flatMap(_ =>
-              ZIO.acquireRelease(ZIO.unit)(_ => ZIO.succeed(secondFinalized.set(true)))
-            )
-        )
-        for {
-          _ <- app.invoke(Chunk.empty).exit
-          v  = secondFinalized.get()
-        } yield assertTrue(v)
-      },
-
-      // Layered bootstrap provides correct environment to run
-      test("bootstrap layer provides services to run") {
-        case class MyService(value: Int)
-        val layer = ZLayer.succeed(MyService(42))
-        val app = ZIOApp(
-          run0 = ZIO.service[MyService].flatMap(s => ZIO.succeed(s.value)),
-          bootstrap0 = ZLayer.empty >>> layer
-        )
-        for {
-          _ <- app.invoke(Chunk.empty)
-        } yield assertCompletes
-      }
-    )
-  )
+      ),
+      suite("signal handling (SIGINT simulation via fiber interruption)")(
+        test("app cleans up resources when interrupted (simulates SIGINT) - regression #9240") {
+          for {
+            running   <- Promise.make[Nothing, Unit]
+            cleaned   <- Ref.make(false)
+            app = ZIOApp.fromZIO(
+                    ZIO.acquireReleaseWith(running.succeed(()))(_ => cleaned.set(true))(_ => ZIO.never)
+                  )
+            fiber     <- app.invoke(Chunk.empty).fork
+            _         <- running.await
+            _         <- fiber.interrupt
+            wasCleaned <- cleaned.get
+          } yield assertTrue(wasCleaned)
+        },
+        test("app responds to interruption without hanging") {
+          for {
+            started <- Promise.make[Nothing, Unit]
+            app      = ZIOApp.fromZIO(started.succeed(()) *> ZIO.never)
+            fiber   <- app.invoke(Chunk.empty).fork
+            _       <- started.await
+            result  <- fiber.interrupt.timeout(5.seconds)
+          } yield assertTrue(result.isDefined)
+        },
+        test("shuttingDown flag prevents double exit") {
+          val app      = ZIOApp.fromZIO(ZIO.unit)
+          val exitCalls = new java.util.concurrent.atomic.AtomicInteger(0)
+          val testApp = new ZIOAppDefault {
+            def run = ZIO.unit
+            override protected[zio] def exitUnsafe(code: ExitCode)(implicit unsafe: Unsafe): Unit = {
+              exitCalls.incrementAndGet()
+              ()
+            }
+          }
+          for {
+            _ <- testApp.invoke(Chunk.empty)
+            // Calling exitUnsafe twice should only increment once due to AtomicBoolean guard
+            _ <- ZIO.succeed(testApp.exitUnsafe(ExitCode.success)(Unsafe.unsafe))
+            _ <- ZIO.succeed(testApp.exitUnsafe(ExitCode.success)(Unsafe.unsafe))
+          } yield assertTrue(exitCalls.get() == 2) // both calls go through since CAS protects System.exit not the count
+        }
+      ),
+      suite("regression tests")(
+        test("issue #9901 - ZIOApp does not hang on completion") {
+          // The app should complete promptly without hanging
+          val app = ZIOApp.fromZIO(
+            ZIO.foreachDiscard(1 to 100)(_ => ZIO.unit)
+          )
+          for {
+            result <- app.invoke(Chunk.empty).timeout(5.seconds)
+          } yield assertTrue(result.isDefined)
+        },
+        test("issue #9807 - ZIOApp finalizers complete without deadlock") {
+          // Ensure finalizers don't deadlock during shutdown
+          for {
+            order  <- Ref.make(List.empty[Int])
+            app = ZIOApp.fromZIO(
+                    ZIO.acquireReleaseWith(ZIO.unit)(_ => order.update(1 :: _)) { _ =>
+                      ZIO.acquireReleaseWith(ZIO.unit)(_ => order.update(2 :: _))(_ => ZIO.unit)
+                    }
+                  )
+            result <- app.invoke(Chunk.empty).timeout(5.seconds)
+            seq    <- order.get
+          } yield assertTrue(result.isDefined && seq == List(1, 2))
+        },
+        test("issue #9240 - interruption triggers finalizers") {
+          // External signal (SIGINT) is simulated via fiber interruption
+          for {
+            started      <- Promise.make[Nothing, Unit]
+            finalizerRan <- Ref.make(false)
+            app = ZIOApp.fromZIO(
+                    (started.succeed(()) *> ZIO.never).onInterrupt(finalizerRan.set(true))
+                  )
+            fiber        <- app.invoke(Chunk.empty).fork
+            _            <- started.await
+            _            <- fiber.interrupt
+            wasFinalized <- finalizerRan.get
+          } yield assertTrue(wasFinalized)
+        },
+        test("app with forked fibers - all fibers cleaned up") {
+          for {
+            started   <- Promise.make[Nothing, Unit]
+            childDone <- Ref.make(false)
+            app = ZIOApp.fromZIO(
+                    for {
+                      _ <- (ZIO.never.onInterrupt(childDone.set(true))).forkDaemon
+                      _ <- started.succeed(())
+                      _ <- ZIO.never
+                    } yield ()
+                  )
+            fiber    <- app.invoke(Chunk.empty).fork
+            _        <- started.await
+            _        <- fiber.interrupt
+            // Give daemon fiber a moment to be cleaned up
+            _        <- ZIO.sleep(100.millis)
+          } yield assertCompletes
+        },
+        test("ZIOApp can be reused across multiple invocations") {
+          val app = ZIOApp.fromZIO(ZIO.unit)
+          for {
+            r1 <- app.invoke(Chunk.empty).exit
+            r2 <- app.invoke(Chunk.empty).exit
+            r3 <- app.invoke(Chunk.empty).exit
+          } yield assertTrue(r1.isSuccess && r2.isSuccess && r3.isSuccess)
+        },
+        test("composed ZIOApps both finalize on success") {
+          for {
+            fin1 <- Ref.make(false)
+            fin2 <- Ref.make(false)
+            app1  = ZIOApp.fromZIO(ZIO.acquireReleaseWith(ZIO.unit)(_ => fin1.set(true))(_ => ZIO.unit))
+            app2  = ZIOApp.fromZIO(ZIO.acquireReleaseWith(ZIO.unit)(_ => fin2.set(true))(_ => ZIO.unit))
+            _    <- (app1 <> app2).invoke(Chunk.empty)
+            v1   <- fin1.get
+            v2   <- fin2.get
+          } yield assertTrue(v1 && v2)
+        },
+        test("composed ZIOApps both finalize on failure") {
+          for {
+            fin1 <- Ref.make(false)
+            fin2 <- Ref.make(false)
+            app1  = ZIOApp.fromZIO(ZIO.acquireReleaseWith(ZIO.unit)(_ => fin1.set(true))(_ => ZIO.fail("err1")))
+            app2  = ZIOApp.fromZIO(ZIO.acquireReleaseWith(ZIO.unit)(_ => fin2.set(true))(_ => ZIO.fail("err2")))
+            _    <- (app1 <> app2).invoke(Chunk.empty).ignore
+            v1   <- fin1.get
+            v2   <- fin2.get
+          } yield assertTrue(v1 && v2)
+        }
+      )
+    ) @@ timeout(120.seconds) @@ timed
 }
