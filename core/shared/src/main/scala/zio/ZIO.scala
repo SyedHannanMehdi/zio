@@ -16,6 +16,15 @@
 
 package zio
 
-// NOTE: This file is intentionally left as a patch-style comment.
-// The actual fix is applied to FoldCauseZIO.scala and Cause.scala below.
-// See the PR description for full context.
+import zio.internal.FiberScope
+import zio.metrics.MetricLabel
+import zio.metrics.Metrics
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
+import java.io.IOException
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.function.IntFunction
+import scala.annotation.implicitNotFound
+import scala.collection.mutable.ListBuffer
+import scala.concurrent.ExecutionContext
+import scala.reflect.ClassTag
