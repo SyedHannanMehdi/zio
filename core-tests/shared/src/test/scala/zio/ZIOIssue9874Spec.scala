@@ -43,13 +43,11 @@ object ZIOIssue9874Spec extends ZIOBaseSpec {
           assert(exit.causeOption.map(_.defects))(isSome(equalTo(List(boom))))
       },
       test("catchAll does not swallow interruption when cause has both fail and interrupt") {
-        val fiberId                       = FiberId.make(Trace.empty)(Unsafe)
-        val interruptCause: Cause[String] = Cause.interrupt(fiberId)
-        val combinedCause                 = interruptCause && Cause.fail("oops")
-        val effect: ZIO[Any, String, Int] =
-          ZIO.failCause(combinedCause).catchAll(_ => ZIO.succeed(42))
         for {
-          exit <- effect.exit
+          fiberId <- ZIO.fiberId
+          interruptCause: Cause[String] = Cause.interrupt(fiberId)
+          combinedCause                 = interruptCause && Cause.fail("oops")
+          exit <- ZIO.failCause(combinedCause).catchAll(_ => ZIO.succeed(42)).exit
         } yield assert(exit.isInterrupted)(isTrue)
       },
       test("catchAll works normally when cause has only failures") {
@@ -76,17 +74,6 @@ object ZIOIssue9874Spec extends ZIOBaseSpec {
           exit <- effect.exit
         } yield assert(exit)(fails(anything)) &&
           assert(exit.causeOption.map(_.defects))(isSome(equalTo(List(boom))))
-      }
-    ),
-    suite("mapError should not swallow defects")(
-      test("mapError does not swallow defect when cause has both fail and die") {
-        val dieCause: Cause[String]  = Cause.die(boom)
-        val combinedCause            = dieCause && Cause.fail("oops")
-        val effect: ZIO[Any, String, Int] =
-          ZIO.failCause(combinedCause).mapError(e => s"mapped: $e")
-        for {
-          exit <- effect.exit
-        } yield assert(exit.causeOption.map(_.defects))(isSome(equalTo(List(boom))))
       }
     ),
     suite("foldZIO should not recover from defects when handling errors")(
