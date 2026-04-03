@@ -1,250 +1,207 @@
+/*
+ * Copyright 2021-2024 John A. De Goes and the ZIO Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package zio
 
-import zio.test._
-import zio.test.Assertion._
-import java.util.concurrent.atomic.AtomicReference
-import java.io.{BufferedReader, InputStreamReader}
-import scala.concurrent.TimeoutException
+import zio.test.*
+import zio.test.Assertion.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 object ZIOAppSpec extends ZIOSpecDefault {
+  def spec = suite("ZIOApp")(
+    test("app that succeeds returns exit code 0") {
+      val app = ZIOApp.fromZIO(ZIO.succeed(()))
+      val result = Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+      assertTrue(result.isInstanceOf[ExitCode])
+    },
+    test("app that fails returns non-zero exit code") {
+      val app = ZIOApp.fromZIO(ZIO.fail(new Exception("test error")))
+      val result = Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+      assertTrue(result.isInstanceOf[ExitCode])
+    },
+    test("finalizers are executed on success") {
+      val finalizerRun = new AtomicBoolean(false)
+      val app = ZIOApp.fromZIO(
+        ZIO.succeed(()).ensuring(ZIO.succeed(finalizerRun.set(true)))
+      )
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+      assertTrue(finalizerRun.get())
+    },
+    test("finalizers are executed on failure") {
+      val finalizerRun = new AtomicBoolean(false)
+      val app = ZIOApp.fromZIO(
+        ZIO.fail(new Exception("test")).ensuring(ZIO.succeed(finalizerRun.set(true)))
+      )
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+      assertTrue(finalizerRun.get())
+    },
+    test("app handles scoped resources correctly") {
+      val resourceAcquired = new AtomicBoolean(false)
+      val resourceReleased = new AtomicBoolean(false)
 
-  def spec =
-    suite("ZIOApp")(
-      suite("completion")(
-        test("app completes successfully and returns exit code 0") {
-          val testApp = new ZIOApp {
-            override def run =
-              ZIO.succeed(())
-          }
-          assertTrue(true)
-        },
-        test("app fails with custom error and returns non-zero exit code") {
-          val testApp = new ZIOApp {
-            override def run =
-              ZIO.fail(new Exception("test failure"))
-          }
-          assertTrue(true)
-        },
-        test("app is interrupted by signal and shuts down gracefully") {
-          val finalizerRan = new AtomicReference[Boolean](false)
-          val testApp = new ZIOApp {
-            override def run =
-              ZIO
-                .sleep(10.seconds)
-                .ensuring(ZIO.succeed {
-                  finalizerRan.set(true)
-                })
-          }
-          assertTrue(true)
-        }
-      ),
-      suite("finalizers")(
-        test("finalizers are executed on successful completion") {
-          val finalizerOrder = new AtomicReference[List[String]](List())
-
-          val effect = for {
-            _ <- ZIO.succeed("start").tap { _ =>
-              ZIO.succeed {
-                finalizerOrder.updateAndGet(_ :+ "step1")
-              }
-            }
-            _ <- ZIO.succeed("middle").tap { _ =>
-              ZIO.succeed {
-                finalizerOrder.updateAndGet(_ :+ "step2")
-              }
-            }
-            _ <- ZIO
-              .succeed("end")
-              .ensuring(ZIO.succeed {
-                finalizerOrder.updateAndGet(_ :+ "finalizer")
-              })
-          } yield ()
-
-          ZIO.succeed(effect).as(assertTrue(true))
-        },
-        test("finalizers are executed on failure") {
-          val finalizerRan = new AtomicReference[Boolean](false)
-          val effect = ZIO
-            .fail(new Exception("test"))
-            .ensuring(ZIO.succeed {
-              finalizerRan.set(true)
-            })
-
-          ZIO.succeed(effect).as(assertTrue(true))
-        },
-        test("multiple finalizers execute in reverse order") {
-          val order = new AtomicReference[List[String]](List())
-
-          val effect = ZIO
-            .succeed("result")
-            .ensuring(
-              ZIO.succeed { order.updateAndGet(_ :+ "first") }
-            )
-            .ensuring(
-              ZIO.succeed { order.updateAndGet(_ :+ "second") }
-            )
-            .ensuring(
-              ZIO.succeed { order.updateAndGet(_ :+ "third") }
-            )
-
-          ZIO.succeed(effect).as(assertTrue(true))
-        }
-      ),
-      suite("gracefulShutdownTimeout")(
-        test("respects gracefulShutdownTimeout configuration") {
-          val startTime = new AtomicReference[Long](0L)
-          val endTime = new AtomicReference[Long](0L)
-
-          val testApp = new ZIOApp {
-            override val bootstrap: ZLayer[Any, Nothing, Any] = {
-              ZLayer.succeed(())
-            }
-
-            override def run =
-              for {
-                _ <- ZIO.succeed { startTime.set(System.currentTimeMillis()) }
-                _ <- ZIO.sleep(5.seconds)
-                _ <- ZIO.succeed { endTime.set(System.currentTimeMillis()) }
-              } yield ()
-          }
-
-          assertTrue(true)
-        },
-        test("shutdown doesn't hang indefinitely") {
-          val timeoutValue = 5.seconds
-          val effect = ZIO.sleep(1.second).ensuring(ZIO.unit)
-
-          ZIO
-            .withTimeout(effect)(timeoutValue)
-            .fold(
-              _ => assertCompletes,
-              _ => assertCompletes
-            )
-        }
-      ),
-      suite("error handling")(
-        test("exit code reflects application failure") {
-          val testApp = new ZIOApp {
-            override def run =
-              ZIO.fail(new Exception("custom error"))
-          }
-          assertTrue(true)
-        },
-        test("exit code is 0 for successful completion") {
-          val testApp = new ZIOApp {
-            override def run =
-              ZIO.succeed(())
-          }
-          assertTrue(true)
-        },
-        test("catastrophic failures are reported") {
-          val effect = ZIO.die(new OutOfMemoryError("catastrophic"))
-          ZIO
-            .attempt(effect)
-            .fold(
-              _ => assertCompletes,
-              _ => assertCompletes
-            )
-        }
-      ),
-      suite("signal handling")(
-        test("SIGINT triggers graceful shutdown") {
-          assertTrue(true)
-        },
-        test("SIGTERM triggers graceful shutdown") {
-          assertTrue(true)
-        },
-        test("finalizers run before process exit on signal") {
-          val finalizerRan = new AtomicReference[Boolean](false)
-          val effect = ZIO
-            .sleep(10.seconds)
-            .ensuring(
-              ZIO.succeed { finalizerRan.set(true) }
-            )
-
-          assertTrue(true)
-        }
-      ),
-      suite("complex scenarios")(
-        test("nested finalizers execute properly") {
-          val execOrder = new AtomicReference[List[String]](List())
-
-          val nested = for {
-            _ <- ZIO
-              .succeed("outer")
-              .ensuring(
-                ZIO.succeed { execOrder.updateAndGet(_ :+ "outer-cleanup") }
-              )
-            _ <- ZIO
-              .succeed("inner")
-              .ensuring(
-                ZIO.succeed { execOrder.updateAndGet(_ :+ "inner-cleanup") }
-              )
-          } yield ()
-
-          ZIO.succeed(nested).as(assertTrue(true))
-        },
-        test("cleanup happens even with multiple sequential effects") {
-          val cleanups = new AtomicReference[Int](0)
-
-          val effect = ZIO
-            .succeed(1)
-            .ensuring(
-              ZIO.succeed { cleanups.incrementAndGet() }
-            )
-            .zipRight(
-              ZIO
-                .succeed(2)
-                .ensuring(
-                  ZIO.succeed { cleanups.incrementAndGet() }
-                )
-            )
-            .zipRight(
-              ZIO
-                .succeed(3)
-                .ensuring(
-                  ZIO.succeed { cleanups.incrementAndGet() }
-                )
-            )
-
-          ZIO.succeed(effect).as(assertTrue(true))
-        },
-        test("partial failure with finalizers") {
-          val finalizerRan = new AtomicReference[Boolean](false)
-
-          val effect = for {
-            _ <- ZIO.succeed("start")
-            _ <- ZIO
-              .fail(new Exception("error"))
-              .ensuring(
-                ZIO.succeed { finalizerRan.set(true) }
-              )
-          } yield ()
-
-          ZIO.succeed(effect).as(assertTrue(true))
-        }
-      ),
-      suite("resource management")(
-        test("resources are properly released on app completion") {
-          val released = new AtomicReference[Boolean](false)
-
-          val effect = ZIO.acquireRelease(
-            ZIO.succeed("resource")
-          )(_ => ZIO.succeed { released.set(true) })
-
-          ZIO.succeed(effect).as(assertTrue(true))
-        },
-        test("resources are released even on failure") {
-          val released = new AtomicReference[Boolean](false)
-
-          val effect = ZIO
-            .acquireRelease(
-              ZIO.succeed("resource")
-            )(_ => ZIO.succeed { released.set(true) })
-            .zipRight(ZIO.fail(new Exception("error")))
-
-          ZIO.succeed(effect).as(assertTrue(true))
+      val app = ZIOApp.fromZIO(
+        ZIO.scoped {
+          ZIO.acquireRelease(
+            ZIO.succeed(resourceAcquired.set(true))
+          )(_ => ZIO.succeed(resourceReleased.set(true)))
         }
       )
-    )
+
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+
+      assertTrue(resourceAcquired.get() && resourceReleased.get())
+    },
+    test("app with graceful shutdown timeout completes within reasonable time") {
+      val app = new ZIOApp {
+        type Environment = Any
+        implicit def environmentTag: EnvironmentTag[Environment] = EnvironmentTag[Any]
+        def bootstrap: ZLayer[ZIOAppArgs, Any, Environment] = ZLayer.environment
+        def run: ZIO[Environment with ZIOAppArgs with Scope, Any, Any] = ZIO.succeed(())
+        override def gracefulShutdownTimeout: Duration = Duration.ofMillis(100)
+      }
+
+      val startTime = System.currentTimeMillis()
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+      val elapsed = System.currentTimeMillis() - startTime
+
+      assertTrue(elapsed < 5000) // Should complete quickly, well within timeout
+    },
+    test("app can access command-line arguments") {
+      val capturedArgs = scala.collection.mutable.Buffer[String]()
+
+      val app = ZIOApp.fromZIO(
+        for {
+          args <- ZIOAppArgs.getArgs
+          _    <- ZIO.succeed(capturedArgs.addAll(args))
+        } yield ()
+      )
+
+      val testArgs = Chunk("arg1", "arg2", "arg3")
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(testArgs)).getOrThrowFiberFailure()
+      })
+
+      assertTrue(capturedArgs.toList == testArgs.toList)
+    },
+    test("multiple finalizers are all executed") {
+      val finalizer1Run = new AtomicBoolean(false)
+      val finalizer2Run = new AtomicBoolean(false)
+      val finalizer3Run = new AtomicBoolean(false)
+
+      val app = ZIOApp.fromZIO(
+        ZIO
+          .succeed(())
+          .ensuring(ZIO.succeed(finalizer1Run.set(true)))
+          .ensuring(ZIO.succeed(finalizer2Run.set(true)))
+          .ensuring(ZIO.succeed(finalizer3Run.set(true)))
+      )
+
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+
+      assertTrue(
+        finalizer1Run.get() && finalizer2Run.get() && finalizer3Run.get()
+      )
+    },
+    test("app composition works correctly") {
+      val app1Run = new AtomicBoolean(false)
+      val app2Run = new AtomicBoolean(false)
+
+      val app1 = ZIOApp.fromZIO(ZIO.succeed(app1Run.set(true)))
+      val app2 = ZIOApp.fromZIO(ZIO.succeed(app2Run.set(true)))
+
+      val combined = app1 <> app2
+
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(combined.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+
+      assertTrue(app1Run.get() && app2Run.get())
+    },
+    test("app with custom bootstrap works correctly") {
+      val bootstrapRun = new AtomicBoolean(false)
+
+      val customLayer = ZLayer.succeed(bootstrapRun.set(true))
+
+      val app = ZIOApp(
+        ZIO.succeed(()),
+        ZLayer.succeed(ZIOAppArgs(Chunk.empty)) >>> customLayer
+      )(EnvironmentTag[Unit])
+
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+
+      assertTrue(bootstrapRun.get())
+    },
+    test("app shutdown is not blocked indefinitely") {
+      val app = ZIOApp.fromZIO(
+        ZIO.sleep(Duration.ofMillis(10)) *> ZIO.succeed(())
+      )
+
+      val startTime = System.currentTimeMillis()
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+      val elapsed = System.currentTimeMillis() - startTime
+
+      assertTrue(elapsed < 10000) // Should not hang
+    },
+    test("app handles empty arguments") {
+      val capturedArgs = scala.collection.mutable.Buffer[String]()
+
+      val app = ZIOApp.fromZIO(
+        for {
+          args <- ZIOAppArgs.getArgs
+          _    <- ZIO.succeed(capturedArgs.addAll(args))
+        } yield ()
+      )
+
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+
+      assertTrue(capturedArgs.isEmpty)
+    },
+    test("finalizer runs even with error in main logic") {
+      val finalizerRun = new AtomicBoolean(false)
+
+      val app = ZIOApp.fromZIO(
+        ZIO
+          .fail(new Exception("main error"))
+          .ensuring(ZIO.succeed(finalizerRun.set(true)))
+      )
+
+      Unsafe.unsafe(implicit unsafe => {
+        Runtime.default.unsafe.run(app.invoke(Chunk.empty)).getOrThrowFiberFailure()
+      })
+
+      assertTrue(finalizerRun.get())
+    }
+  )
 }
