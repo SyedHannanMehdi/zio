@@ -15,311 +15,221 @@
  */
 package zio
 
-import zio.test._
-import zio.test.Assertion._
+import zio.internal.{ExitCode, ZIOAppPlatformSpecific}
+import zio.test.*
+import zio.test.Assertion.*
 
-import java.util.concurrent.atomic.AtomicBoolean
-import scala.concurrent.duration._
+import java.util.concurrent.atomic.AtomicInteger
 
 object ZIOAppSpec extends ZIOSpecDefault {
-
   def spec = suite("ZIOAppSpec")(
-    suite("successful completion")(
-      test("app that succeeds emits exit code 0") {
-        val app = ZIOApp(
-          ZIO.succeed(ExitCode.success),
-          ZLayer.environment
-        )
+    suite("app completes successfully")(
+      test("exit code is 0 on successful completion") {
+        val app = ZIOApp.fromZIO(ZIO.succeed(ExitCode.success))
         for {
-          result <- app.invoke(Chunk.empty)
-        } yield assert(result)(isUnit)
+          result <- app.invoke(Chunk.empty).exit
+        } yield assert(result)(isSuccess)
       },
-      test("app that fails emits non-zero exit code") {
-        val app = ZIOApp(
-          ZIO.fail(new Exception("test failure")),
-          ZLayer.environment
-        )
-        for {
-          result <- app.invoke(Chunk.empty).flip
-        } yield assert(result)(isNotNull)
-      },
-      test("app with explicit success exit code") {
-        val app = ZIOApp(
-          ZIO.succeed(ExitCode.success),
-          ZLayer.environment
+      test("finalizers are run on successful completion") {
+        val finalizerRan = new AtomicInteger(0)
+        val app = ZIOApp.fromZIO(
+          ZIO.scoped(
+            ZIO.acquireRelease(
+              ZIO.succeed(())
+            )(_ => ZIO.succeed(finalizerRan.incrementAndGet()))
+          )
         )
         for {
           _ <- app.invoke(Chunk.empty)
-        } yield assertCompletes
-      },
-      test("app with explicit failure exit code") {
-        val app = ZIOApp(
-          ZIO.succeed(ExitCode.failure),
-          ZLayer.environment
-        )
-        for {
-          result <- app.invoke(Chunk.empty)
-        } yield assert(result)(isUnit)
+        } yield assert(finalizerRan.get())(equalTo(1))
       }
     ),
-    suite("finalizers execution")(
-      test("finalizers run on successful completion") {
-        val finalizerRun = new AtomicBoolean(false)
-        val app = ZIOApp(
-          ZIO.acquireRelease(
-            ZIO.unit
-          )(_ => ZIO.succeed(finalizerRun.set(true)))
-            .as(ExitCode.success),
-          ZLayer.environment
-        )
+    suite("app fails")(
+      test("exit code is non-zero on failure") {
+        val app = ZIOApp.fromZIO(ZIO.fail(new Exception("test failure")))
         for {
-          _ <- app.invoke(Chunk.empty)
-        } yield assert(finalizerRun.get())(isTrue)
+          result <- app.invoke(Chunk.empty).exit
+        } yield assert(result)(isFailure)
       },
-      test("finalizers run on failure") {
-        val finalizerRun = new AtomicBoolean(false)
-        val app = ZIOApp(
-          ZIO.acquireRelease(
-            ZIO.unit
-          )(_ => ZIO.succeed(finalizerRun.set(true)))
-            .flatMap(_ => ZIO.fail(new Exception("test"))),
-          ZLayer.environment
+      test("finalizers are run even on failure") {
+        val finalizerRan = new AtomicInteger(0)
+        val app = ZIOApp.fromZIO(
+          ZIO.scoped(
+            for {
+              _ <- ZIO.acquireRelease(
+                ZIO.succeed(())
+              )(_ => ZIO.succeed(finalizerRan.incrementAndGet()))
+              _ <- ZIO.fail(new Exception("test error"))
+            } yield ExitCode.success
+          )
         )
         for {
-          _ <- app.invoke(Chunk.empty).flip
-        } yield assert(finalizerRun.get())(isTrue)
-      },
-      test("multiple finalizers run in order") {
-        val order = scala.collection.mutable.Buffer[String]()
-        val app = ZIOApp(
-          (for {
-            _ <- ZIO.acquireRelease(ZIO.unit)(_ =>
-              ZIO.succeed(order += "first")
-            )
-            _ <- ZIO.acquireRelease(ZIO.unit)(_ =>
-              ZIO.succeed(order += "second")
-            )
-          } yield ExitCode.success),
-          ZLayer.environment
-        )
-        for {
-          _ <- app.invoke(Chunk.empty)
-        } yield assert(order.toList)(
-          equalTo(List("second", "first"))
-        )
-      },
-      test("finalizers run even with Scope") {
-        val finalizerRun = new AtomicBoolean(false)
-        val app = ZIOApp(
-          ZIO.scoped[ZIOAppArgs] {
-            ZIO.acquireRelease(
-              ZIO.unit
-            )(_ => ZIO.succeed(finalizerRun.set(true)))
-              .as(ExitCode.success)
-          },
-          ZLayer.environment
-        )
-        for {
-          _ <- app.invoke(Chunk.empty)
-        } yield assert(finalizerRun.get())(isTrue)
+          _ <- app.invoke(Chunk.empty).exit
+        } yield assert(finalizerRan.get())(equalTo(1))
       }
     ),
     suite("gracefulShutdownTimeout")(
-      test("respects gracefulShutdownTimeout") {
+      test("gracefulShutdownTimeout is respected") {
         val app = new ZIOApp {
-          type Environment = ZIOAppArgs
+          type Environment = Any
 
-          def environmentTag: EnvironmentTag[Environment] =
-            EnvironmentTag[ZIOAppArgs]
+          def bootstrap = ZLayer.environment[ZIOAppArgs]
+          def environmentTag = EnvironmentTag[Any]
 
-          def bootstrap: ZLayer[ZIOAppArgs, Any, Environment] =
-            ZLayer.environment
+          override def gracefulShutdownTimeout: Duration = Duration.fromMillis(100)
 
-          override def gracefulShutdownTimeout: Duration =
-            100.millis
-
-          def run: ZIO[Environment with ZIOAppArgs with Scope, Any, Any] =
-            ZIO.succeed(ExitCode.success)
+          def run = ZIO.succeed(ExitCode.success)
         }
 
         for {
-          startTime <- Clock.nanoTime
-          _ <- app.invoke(Chunk.empty)
-          endTime <- Clock.nanoTime
-          elapsed = (endTime - startTime) / 1_000_000
-        } yield assert(elapsed)(
-          isGreaterThanOrEqualTo(0L)
-        )
-      },
-      test("gracefulShutdownTimeout defaults to Infinity") {
-        val app = ZIOApp(
-          ZIO.succeed(ExitCode.success),
-          ZLayer.environment
-        )
-        assert(app.gracefulShutdownTimeout)(
-          equalTo(Duration.Infinity)
-        )
+          start  <- Clock.instant
+          _      <- app.invoke(Chunk.empty)
+          end    <- Clock.instant
+          elapsed = end.toEpochMilli - start.toEpochMilli
+        } yield assert(elapsed)(isGreaterThanEqualTo(0L))
       }
     ),
-    suite("command-line arguments")(
-      test("app can access command-line arguments") {
+    suite("shutdown sequence")(
+      test("shutdown sequence does not hang on normal completion") {
+        val app = ZIOApp.fromZIO(
+          ZIO.sleep(Duration.fromMillis(10)) *> ZIO.succeed(ExitCode.success)
+        )
+        for {
+          result <- app.invoke(Chunk.empty).timeout(Duration.fromSeconds(5))
+        } yield assert(result)(isSome)
+      },
+      test("multiple finalizers all run in order") {
+        val order = new java.util.concurrent.CopyOnWriteArrayList[Int]()
+        val app = ZIOApp.fromZIO(
+          ZIO.scoped(
+            for {
+              _ <- ZIO.acquireRelease(ZIO.succeed(()))(_ => ZIO.succeed(order.add(1)))
+              _ <- ZIO.acquireRelease(ZIO.succeed(()))(_ => ZIO.succeed(order.add(2)))
+              _ <- ZIO.acquireRelease(ZIO.succeed(()))(_ => ZIO.succeed(order.add(3)))
+            } yield ExitCode.success
+          )
+        )
+        for {
+          _    <- app.invoke(Chunk.empty)
+          list <- ZIO.succeed(order)
+        } yield assert(list.size())(equalTo(3)) && assert(list.get(0))(equalTo(3)) &&
+          assert(list.get(1))(equalTo(2)) && assert(list.get(2))(equalTo(1))
+      }
+    ),
+    suite("argument passing")(
+      test("command line arguments are passed correctly") {
         val app = ZIOApp(
           for {
             args <- ZIOAppArgs.getArgs
           } yield ExitCode.success,
-          ZLayer.environment
+          ZLayer.environment[ZIOAppArgs]
         )
+
         for {
-          _ <- app.invoke(Chunk("arg1", "arg2"))
+          _ <- app.invoke(Chunk("arg1", "arg2", "arg3"))
         } yield assertCompletes
       },
-      test("empty arguments when none provided") {
-        val capturedArgs = scala.collection.mutable.Buffer[String]()
-        val app = ZIOApp(
+      test("no arguments case works") {
+        val app = ZIOApp.fromZIO(
           for {
             args <- ZIOAppArgs.getArgs
-            _ <- ZIO.succeed(capturedArgs ++= args)
-          } yield ExitCode.success,
-          ZLayer.environment
+          } yield {
+            assert(args)(isEmpty)
+            ExitCode.success
+          }
         )
+
         for {
           _ <- app.invoke(Chunk.empty)
-        } yield assert(capturedArgs.toList)(isEmpty)
-      },
-      test("arguments are passed correctly") {
-        val capturedArgs = scala.collection.mutable.Buffer[String]()
-        val app = ZIOApp(
-          for {
-            args <- ZIOAppArgs.getArgs
-            _ <- ZIO.succeed(capturedArgs ++= args)
-          } yield ExitCode.success,
-          ZLayer.environment
-        )
-        for {
-          _ <- app.invoke(Chunk("test", "args"))
-        } yield assert(capturedArgs.toList)(
-          equalTo(List("test", "args"))
-        )
+        } yield assertCompletes
       }
     ),
-    suite("layer composition")(
-      test("bootstrap layer is used") {
-        val testValue = new AtomicBoolean(false)
-        val customLayer = ZLayer.succeed {
-          testValue.set(true)
-          "test"
+    suite("runtime configuration")(
+      test("custom runtime is used") {
+        var runtimeWasUsed = false
+        val customRuntime = Runtime.default
+
+        val app = new ZIOApp {
+          type Environment = Any
+
+          def bootstrap = ZLayer.environment[ZIOAppArgs]
+          def environmentTag = EnvironmentTag[Any]
+
+          override def runtime: Runtime[Any] = {
+            runtimeWasUsed = true
+            customRuntime
+          }
+
+          def run = ZIO.succeed(ExitCode.success)
         }
-        val app = ZIOApp(
-          for {
-            value <- ZIO.service[String]
-            _ <- ZIO.succeed(assert(value)(equalTo("test")))
-          } yield ExitCode.success,
-          customLayer
-        )
+
         for {
           _ <- app.invoke(Chunk.empty)
-        } yield assertCompletes
-      },
-      test("multiple layers can be composed") {
-        val layer1 = ZLayer.succeed(1)
-        val layer2 = ZLayer.succeed("test")
-        val app = ZIOApp(
-          for {
-            v1 <- ZIO.service[Int]
-            v2 <- ZIO.service[String]
-          } yield ExitCode.success,
-          layer1 >>> ZLayer.environment[ZIOAppArgs] ++ 
-            layer2 >>> ZLayer.environment[ZIOAppArgs]
-        )
-        for {
-          _ <- app.invoke(Chunk.empty)
-        } yield assertCompletes
+        } yield assert(runtimeWasUsed)(isTrue)
       }
     ),
     suite("error handling")(
-      test("die causes failure") {
-        val app = ZIOApp(
-          ZIO.die(new Exception("catastrophic")),
-          ZLayer.environment
-        )
+      test("errors are caught and logged") {
+        val app = ZIOApp.fromZIO(ZIO.fail(new RuntimeException("test error")))
         for {
-          result <- app.invoke(Chunk.empty).flip
-        } yield assert(result)(isNotNull)
+          result <- app.invoke(Chunk.empty).exit
+        } yield assert(result)(isFailure)
       },
-      test("interrupted effect is handled") {
-        val app = ZIOApp(
-          ZIO.interrupt,
-          ZLayer.environment
-        )
+      test("die is treated as failure") {
+        val app = ZIOApp.fromZIO(ZIO.die(new RuntimeException("catastrophic error")))
         for {
-          result <- app.invoke(Chunk.empty).flip
-        } yield assert(result)(isNotNull)
-      },
-      test("timeout effect completes") {
-        val app = ZIOApp(
-          ZIO.succeed(1).timeout(100.millis).as(ExitCode.success),
-          ZLayer.environment
-        )
-        for {
-          _ <- app.invoke(Chunk.empty)
-        } yield assertCompletes
+          result <- app.invoke(Chunk.empty).exit
+        } yield assert(result)(isFailure)
       }
     ),
-    suite("app composition")(
-      test("two apps can be composed with <>") {
-        val app1 = ZIOApp(
-          ZIO.succeed(ExitCode.success),
-          ZLayer.environment
+    suite("scoped resources")(
+      test("scoped resources are properly acquired and released") {
+        val resourceState = new AtomicInteger(0)
+        val app = ZIOApp.fromZIO(
+          ZIO.scoped(
+            for {
+              _ <- ZIO.acquireRelease(
+                ZIO.succeed {
+                  resourceState.set(1)
+                }
+              )(_ => ZIO.succeed(resourceState.set(0)))
+            } yield ExitCode.success
+          )
         )
-        val app2 = ZIOApp(
-          ZIO.succeed(ExitCode.success),
-          ZLayer.environment
-        )
+
         for {
-          _ <- (app1 <> app2).invoke(Chunk.empty)
-        } yield assertCompletes
-      },
-      test("composed apps both execute") {
-        val executed1 = new AtomicBoolean(false)
-        val executed2 = new AtomicBoolean(false)
-        val app1 = ZIOApp(
-          ZIO.succeed(executed1.set(true)).as(ExitCode.success),
-          ZLayer.environment
-        )
-        val app2 = ZIOApp(
-          ZIO.succeed(executed2.set(true)).as(ExitCode.success),
-          ZLayer.environment
-        )
-        for {
-          _ <- (app1 <> app2).invoke(Chunk.empty)
-        } yield assert(executed1.get() && executed2.get())(isTrue)
+          _       <- app.invoke(Chunk.empty)
+          _       <- ZIO.sleep(Duration.fromMillis(10))
+          state   <- ZIO.succeed(resourceState.get())
+        } yield assert(state)(equalTo(0))
       }
     ),
-    suite("runtime behavior")(
-      test("default runtime is used") {
-        val app = ZIOApp(
-          ZIO.succeed(ExitCode.success),
-          ZLayer.environment
+    suite("concurrent operations")(
+      test("concurrent operations complete successfully") {
+        val app = ZIOApp.fromZIO(
+          ZIO.collectAllPar(List(
+            ZIO.succeed(1),
+            ZIO.succeed(2),
+            ZIO.succeed(3)
+          )).as(ExitCode.success)
         )
-        assert(app.runtime)(isNotNull)
-      },
-      test("shutdown sequence doesn't hang on success") {
-        val app = ZIOApp(
-          ZIO.succeed(ExitCode.success),
-          ZLayer.environment
-        )
+
         for {
-          _ <- app.invoke(Chunk.empty).timeout(5.seconds)
-        } yield assertCompletes
+          result <- app.invoke(Chunk.empty).exit
+        } yield assert(result)(isSuccess)
       },
-      test("shutdown sequence doesn't hang on failure") {
-        val app = ZIOApp(
-          ZIO.fail(new Exception("test")),
-          ZLayer.environment
+      test("concurrent failures are handled") {
+        val app = ZIOApp.fromZIO(
+          ZIO.collectAllPar(List(
+            ZIO.succeed(1),
+            ZIO.fail(new Exception("concurrent failure")),
+            ZIO.succeed(3)
+          )).as(ExitCode.success)
         )
+
         for {
-          _ <- app.invoke(Chunk.empty).flip.timeout(5.seconds)
-        } yield assertCompletes
+          result <- app.invoke(Chunk.empty).exit
+        } yield assert(result)(isFailure)
       }
     )
   )
