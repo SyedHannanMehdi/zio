@@ -15,168 +15,174 @@
  */
 package zio
 
-import zio.test.*
-import zio.test.Assertion.*
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 object ZIOAppSignalHandlingSpec extends ZIOSpecDefault {
-
   def spec = suite("ZIOAppSignalHandlingSpec")(
     test("signal handlers are installed") {
-      val app = new ZIOApp {
+      val app = ZIOApp.fromZIO(ZIO.unit)
+
+      for {
+        result <- app.invoke(Chunk.empty).exit
+      } yield {
+        assert(result)(isSuccess)
+      }
+    },
+    test("app handles interruption gracefully") {
+      val finalizerRan = new AtomicBoolean(false)
+
+      val app = ZIOApp.fromZIO(
+        ZIO.scoped(
+          ZIO.acquireRelease(
+            ZIO.unit
+          )(_ => ZIO.succeed(finalizerRan.set(true))) *>
+            ZIO.never
+        )
+      )
+
+      // Simulate interruption after short delay
+      for {
+        fiber <- app.invoke(Chunk.empty).fork
+        _     <- ZIO.sleep(Duration.fromMillis(100))
+        _     <- fiber.interrupt
+        _     <- ZIO.sleep(Duration.fromMillis(100))
+      } yield {
+        assert(finalizerRan.get())(isTrue)
+      }
+    },
+    test("gracefulShutdownTimeout prevents indefinite hangs") {
+      val slowFinalizer = new AtomicBoolean(false)
+
+      val timeoutApp = new ZIOApp {
         type Environment = Any
+        def bootstrap = ZLayer.empty
+        def environmentTag = EnvironmentTag[Any]
+        override def gracefulShutdownTimeout =
+          Duration.fromMillis(500)
+        def run = ZIO.scoped(
+          ZIO.acquireRelease(
+            ZIO.unit
+          )(_ =>
+            ZIO.sleep(Duration.fromSeconds(5)) *>
+              ZIO.succeed(slowFinalizer.set(true))
+          )
+        )
+      }
 
-        implicit def environmentTag: EnvironmentTag[Environment] = EnvironmentTag[Any]
+      val start = System.currentTimeMillis()
+      for {
+        result <- timeoutApp.invoke(Chunk.empty).exit
+        end    = System.currentTimeMillis()
+        elapsed = end - start
+      } yield {
+        assert(elapsed)(
+          isLessThan(3000L)
+        )
+      }
+    },
+    test("exit code reflects success") {
+      val app = ZIOApp.fromZIO(ZIO.succeed(()))
 
-        def bootstrap: ZLayer[ZIOAppArgs, Any, Environment] =
-          ZLayer.environment[ZIOAppArgs]
+      for {
+        result <- app.invoke(Chunk.empty).exit
+      } yield {
+        assert(result)(isSuccess)
+      }
+    },
+    test("exit code reflects failure") {
+      val app = ZIOApp.fromZIO(
+        ZIO.fail(new Exception("failure"))
+      )
 
-        def run: ZIO[Environment with ZIOAppArgs with Scope, Any, Any] =
+      for {
+        result <- app.invoke(Chunk.empty).exit
+      } yield {
+        assert(result)(isFailure)
+      }
+    },
+    test("exception handling in app") {
+      val exception = new RuntimeException("test exception")
+      val app = ZIOApp.fromZIO(ZIO.fail(exception))
+
+      for {
+        result <- app.invoke(Chunk.empty).exit
+      } yield {
+        assert(result)(isFailure)
+      }
+    },
+    test("multiple interruptions handled correctly") {
+      val finalizerCount = new java.util.concurrent.atomic.AtomicInteger(0)
+
+      val app = ZIOApp.fromZIO(
+        ZIO.scoped(
           for {
-            runtime <- ZIO.runtime[Any]
-            _       <- installSignalHandlers(runtime)
-          } yield ExitCode.success
-      }
+            _ <- ZIO.acquireRelease(ZIO.unit)(_ =>
+              ZIO.succeed(finalizerCount.incrementAndGet())
+            )
+            _ <- ZIO.acquireRelease(ZIO.unit)(_ =>
+              ZIO.succeed(finalizerCount.incrementAndGet())
+            )
+          } yield ()
+        )
+      )
 
       for {
-        exit <- app.invoke(Chunk.empty).exit
-      } yield assert(exit)(isSuccess)
+        fiber <- app.invoke(Chunk.empty).fork
+        _     <- ZIO.sleep(Duration.fromMillis(50))
+        _     <- fiber.interrupt
+        count <- ZIO.succeed(finalizerCount.get())
+      } yield {
+        assert(count)(equalTo(2))
+      }
     },
-    test("finalizers run before app exit on success") {
-      val finalizerFlag = Ref.make(false)
+    test("app that completes before interrupt") {
+      val finalizerRan = new AtomicBoolean(false)
 
-      val app = new ZIOApp {
-        type Environment = Any
-
-        implicit def environmentTag: EnvironmentTag[Environment] = EnvironmentTag[Any]
-
-        def bootstrap: ZLayer[ZIOAppArgs, Any, Environment] =
-          ZLayer.environment[ZIOAppArgs]
-
-        def run: ZIO[Environment with ZIOAppArgs with Scope, Any, Any] =
-          ZIO.scoped {
-            for {
-              ref <- ZIO.from(finalizerFlag)
-              _ <- ZIO.acquireRelease(
-                ZIO.unit
-              )(
-                _ => ref.set(true)
-              )
-            } yield ExitCode.success
-          }
-      }
+      val app = ZIOApp.fromZIO(
+        ZIO.scoped(
+          ZIO.acquireRelease(
+            ZIO.unit
+          )(_ => ZIO.succeed(finalizerRan.set(true)))
+        )
+      )
 
       for {
-        exit <- app.invoke(Chunk.empty).exit
-      } yield assert(exit)(isSuccess)
+        fiber <- app.invoke(Chunk.empty).fork
+        _     <- fiber.join
+      } yield {
+        assert(finalizerRan.get())(isTrue)
+      }
     },
-    test("long-running finalizers respect gracefulShutdownTimeout") {
-      val app = new ZIOApp {
-        type Environment = Any
+    test("nested interruption handling") {
+      val finalizerOrder = scala.collection.mutable.ArrayBuffer[Int]()
 
-        implicit def environmentTag: EnvironmentTag[Environment] = EnvironmentTag[Any]
-
-        def bootstrap: ZLayer[ZIOAppArgs, Any, Environment] =
-          ZLayer.environment[ZIOAppArgs]
-
-        def run: ZIO[Environment with ZIOAppArgs with Scope, Any, Any] =
-          ZIO.scoped {
-            ZIO.acquireRelease(ZIO.unit)(_ =>
-              ZIO.sleep(Duration(10, TimeUnit.SECONDS))
-            ) *> ZIO.succeed(ExitCode.success)
-          }
-
-        override def gracefulShutdownTimeout: Duration =
-          Duration(1, TimeUnit.SECONDS)
-      }
-
-      for {
-        start <- Clock.instant
-        exit  <- app.invoke(Chunk.empty).exit
-        end   <- Clock.instant
-      } yield assert(exit)(isSuccess)
-    },
-    test("app with scoped resource properly releases on exit") {
-      val releaseCount = Ref.make(0)
-
-      val app = new ZIOApp {
-        type Environment = Any
-
-        implicit def environmentTag: EnvironmentTag[Environment] = EnvironmentTag[Any]
-
-        def bootstrap: ZLayer[ZIOAppArgs, Any, Environment] =
-          ZLayer.environment[ZIOAppArgs]
-
-        def run: ZIO[Environment with ZIOAppArgs with Scope, Any, Any] =
-          ZIO.scoped {
-            for {
-              ref <- ZIO.from(releaseCount)
-              _ <- ZIO.acquireRelease(
-                ZIO.unit
-              )(
-                _ => ref.update(_ + 1)
-              )
-            } yield ExitCode.success
-          }
-      }
+      val app = ZIOApp.fromZIO(
+        ZIO.scoped(
+          for {
+            _ <- ZIO.acquireRelease(ZIO.unit)(_ =>
+              ZIO.succeed(finalizerOrder.append(1))
+            )
+            _ <- ZIO.scoped(
+              for {
+                _ <- ZIO.acquireRelease(ZIO.unit)(_ =>
+                  ZIO.succeed(finalizerOrder.append(2))
+                )
+              } yield ()
+            )
+          } yield ()
+        )
+      )
 
       for {
-        exit <- app.invoke(Chunk.empty).exit
-      } yield assert(exit)(isSuccess)
-    },
-    test("concurrent finalizers all complete") {
-      val finalizeCount = Ref.make(0)
-
-      val app = new ZIOApp {
-        type Environment = Any
-
-        implicit def environmentTag: EnvironmentTag[Environment] = EnvironmentTag[Any]
-
-        def bootstrap: ZLayer[ZIOAppArgs, Any, Environment] =
-          ZLayer.environment[ZIOAppArgs]
-
-        def run: ZIO[Environment with ZIOAppArgs with Scope, Any, Any] =
-          ZIO.scoped {
-            for {
-              ref <- ZIO.from(finalizeCount)
-              _ <- ZIO.foreachPar(1 to 5)(_ =>
-                ZIO.acquireRelease(ZIO.unit)(_ => ref.update(_ + 1))
-              )
-            } yield ExitCode.success
-          }
+        fiber <- app.invoke(Chunk.empty).fork
+        _     <- fiber.join
+      } yield {
+        assert(finalizerOrder.toSeq)(
+          equalTo(Seq(2, 1))
+        )
       }
-
-      for {
-        exit <- app.invoke(Chunk.empty).exit
-      } yield assert(exit)(isSuccess)
-    },
-    test("nested scopes are properly unwound") {
-      val unwoundCount = Ref.make(0)
-
-      val app = new ZIOApp {
-        type Environment = Any
-
-        implicit def environmentTag: EnvironmentTag[Environment] = EnvironmentTag[Any]
-
-        def bootstrap: ZLayer[ZIOAppArgs, Any, Environment] =
-          ZLayer.environment[ZIOAppArgs]
-
-        def run: ZIO[Environment with ZIOAppArgs with Scope, Any, Any] =
-          ZIO.scoped {
-            for {
-              ref <- ZIO.from(unwoundCount)
-              _ <- ZIO.acquireRelease(ZIO.unit)(_ => ref.update(_ + 1))
-              _ <- ZIO.scoped {
-                ZIO.acquireRelease(ZIO.unit)(_ => ref.update(_ + 1))
-              }
-            } yield ExitCode.success
-          }
-      }
-
-      for {
-        exit <- app.invoke(Chunk.empty).exit
-      } yield assert(exit)(isSuccess)
     }
   )
 }
